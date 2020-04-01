@@ -1,0 +1,32 @@
+[package]
+name = "cord-broker"
+version = "0.1.0"
+edition = "2018"
+authors = ["Cord Contributors"]
+license = "MPL-2.0"
+description = """
+The server-side routing platform for the Cord Platform that exchanges messages between
+publishers and subscribers.
+"""
+homepage = "http://cord-proj.org"
+repository = "https://github.com/cord-proj/cord-broker"
+readme = "README.md"
+keywords = ["cord", "stream"]
+categories = ["network-programming", "data-structures"]
+include = ["src/**/*"]
+
+[dependencies]
+clap = "2.33"
+cord-message = "0.1"
+env_logger = "0.6"
+error-chain = "0.12"
+futures = "0.1"
+futures-locks = "0.3"
+log = "0.4"
+tokio = "0.1"
+uuid = { version = "0.7", features = ["v4"] }
+
+[dev-dependencies]
+cord-client = "0.1"
+cord-message = "0.1"
+lazy_static = "1.3"
