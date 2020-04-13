@@ -11,7 +11,7 @@ on:
 
 jobs:
   check:
-    name: Check
+    name: Cargo Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -30,7 +30,7 @@ jobs:
           command: check
 
   test:
-    name: Test Suite
+    name: Rust Test Suite
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -55,7 +55,7 @@ jobs:
           args: -- --ignored
 
   lints:
-    name: Lints
+    name: Rust Lints
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -80,3 +80,16 @@ jobs:
         with:
           command: clippy
           args: -- -D warnings
+
+  dockerfile:
+    name: Test Build Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Test build Dockerfile
+        uses: docker/build-push-action@v1
+        with:
+          repository: cordproj/cord-client
+          push: false

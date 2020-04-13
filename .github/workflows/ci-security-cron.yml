@@ -6,13 +6,13 @@ on:
 
 jobs:
   audit:
-    name: Audit
+    name: Daily Crate Security Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
         with:
-          ref: releases
+          ref: master
 
       - name: Audit crates
         uses: actions-rs/audit-check@v1

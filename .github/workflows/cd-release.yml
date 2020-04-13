@@ -3,11 +3,11 @@ name: CD Release
 on:
   push:
     branches:
-      - releases
+      - master
 
 jobs:
   release:
-    name: Release
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
