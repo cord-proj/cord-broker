@@ -1,7 +1,7 @@
 use crate::{errors::*, subscriber::Subscriber};
 use cord_message::{Message, Pattern};
-use futures::{self, future, Future};
-use futures_locks::Mutex;
+use futures::{self, future, Future, FutureExt};
+use futures_locks_pre::Mutex;
 use log::debug;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -256,7 +256,7 @@ impl Publisher {
 
     // Route a message to all interested subscribers, making sure we clean up any
     // subscribers that are only executed once (i.e. OnetimeTask).
-    pub fn route(&mut self, message: Message) -> impl Future<Item = (), Error = Error> {
+    pub async fn route(&mut self, message: Message) {
         let name = self.name;
 
         self.inner
@@ -278,613 +278,629 @@ impl Publisher {
 
                 let mut futs = vec![];
 
-                // In the inner loop we may cleanup all of the subscribers in the
-                // `subs` map. This leaves us with an empty map that should also
-                // be tidied up, hence the use of retain() here.
-                (*guard).subscribers.retain(|sub_msg, subs| {
+                for (sub_msg, subs) in (*guard).subscribers {
                     if sub_msg.contains(&message) {
                         debug!("Subscriber {:?} matches {:?}", sub_msg, message);
+
+                        let mut needs_gc = false;
+
                         // We use retain() here, which allows us to cleanup any
                         // subscribers that have OnetimeTask's or whose channels
                         // have been closed.
-                        subs.retain(|_, sub| {
-                            let (retain, f) = sub.recv(message.clone());
-                            futs.push(f);
-                            retain
-                        });
+                        for (_, sub) in subs async {
+                            needs_gc = sub.recv(message.clone()).await;
+                        }
+
+                        subs.retain(|_, sub| async { sub.recv(message.clone()).await });
                         !subs.is_empty() // Retain if map contains subscribers
                     } else {
                         debug!("Subscriber {:?} does not match {:?}", sub_msg, message);
                         true // Retain as we haven't modified the map
                     }
-                });
+                }
+
+                // In the inner loop we may cleanup all of the subscribers in the
+                // `subs` map. This leaves us with an empty map that should also
+                // be tidied up, hence the use of retain() here.
+                // (*guard).subscribers.retain(|sub_msg, subs| {
+                //     if sub_msg.contains(&message) {
+                //         debug!("Subscriber {:?} matches {:?}", sub_msg, message);
+                //         // We use retain() here, which allows us to cleanup any
+                //         // subscribers that have OnetimeTask's or whose channels
+                //         // have been closed.
+                //         subs.retain(|_, sub| async { sub.recv(message.clone()).await });
+                //         !subs.is_empty() // Retain if map contains subscribers
+                //     } else {
+                //         debug!("Subscriber {:?} does not match {:?}", sub_msg, message);
+                //         true // Retain as we haven't modified the map
+                //     }
+                // });
 
                 future::join_all(futs).map(|_| ())
             })
-            .expect("The default executor has shut down")
+            .await
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::future;
-    use futures_locks::Mutex;
-    use lazy_static::lazy_static;
-    use tokio::{
-        runtime::Runtime,
-        sync::{mpsc, oneshot},
-    };
-
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::Mutex as StdMutex,
-    };
-
-    lazy_static! {
-        static ref RUNTIME: StdMutex<TokioRuntime> = StdMutex::new(TokioRuntime::new());
-    }
-
-    // Because each test requires a Tokio runtime, the test pack can exhaust the kernel's
-    // file limit. To mitigate this issue, we use a shared runtime to limit the number of
-    // open file descriptors.
-    struct TokioRuntime {
-        runtime: Option<Runtime>,
-        users: u16,
-    }
-
-    impl TokioRuntime {
-        pub fn new() -> TokioRuntime {
-            TokioRuntime {
-                runtime: None,
-                users: 0,
-            }
-        }
-
-        pub fn start(&mut self) {
-            if self.runtime.is_none() {
-                self.runtime = Some(Runtime::new().unwrap());
-            }
-
-            self.users += 1;
-        }
-
-        pub fn stop(&mut self) {
-            self.users -= 1;
-
-            if self.users == 0 && self.runtime.is_some() {
-                self.runtime
-                    .take()
-                    .unwrap()
-                    .shutdown_on_idle()
-                    .wait()
-                    .unwrap();
-            }
-        }
-
-        pub fn block_on<F>(&mut self, future: F)
-        where
-            F: Send + 'static + Future<Item = (), Error = ()>,
-        {
-            self.runtime.as_mut().unwrap().block_on(future).unwrap();
-        }
-    }
-
-    fn add_message(
-        message: Message,
-        message_subs: HashMap<Uuid, Subscriber>,
-        subs: &mut PublishInner,
-    ) -> Message {
-        let message_c = message.clone();
-        subs.subscribers.insert(message, message_subs);
-        message_c
-    }
-
-    fn add_message_sub(map: &mut HashMap<Uuid, Subscriber>) -> Uuid {
-        let uuid = Uuid::new_v4();
-        map.insert(
-            uuid,
-            Subscriber::Task(Box::new(|_| Box::new(future::ok(())))),
-        );
-        uuid
-    }
-
-    fn add_message_sub_checked(map: &mut HashMap<Uuid, Subscriber>) -> (Uuid, Mutex<bool>) {
-        let uuid = Uuid::new_v4();
-        let mutex = Mutex::new(false);
-        let mutex_c = mutex.clone();
-
-        map.insert(
-            uuid,
-            Subscriber::Task(Box::new(move |_| {
-                Box::new(
-                    mutex
-                        .with(|mut guard| {
-                            (*guard) = true;
-                            future::ok(())
-                        })
-                        .unwrap(),
-                )
-            })),
-        );
-        (uuid, mutex_c)
-    }
-
-    fn add_message_sub_once_checked(map: &mut HashMap<Uuid, Subscriber>) -> (Uuid, Mutex<bool>) {
-        let uuid = Uuid::new_v4();
-        let mutex = Mutex::new(false);
-        let mutex_c = mutex.clone();
-
-        map.insert(
-            uuid,
-            Subscriber::OnetimeTask(Some(Box::new(move |_| {
-                Box::new(
-                    mutex
-                        .with(|mut guard| {
-                            (*guard) = true;
-                            future::ok(())
-                        })
-                        .unwrap(),
-                )
-            }))),
-        );
-        (uuid, mutex_c)
-    }
-
-    // XXX This function should mock the subscribe and unsubscribe functions. However as
-    // we can't yet return `impl Trait` from a Trait, we can't create a mock impl; it
-    // would require that every function returned a trait object instead.
-    // https://github.com/rust-lang/rfcs/pull/2515
-    #[test]
-    fn test_on_link() {
-        RUNTIME.lock().unwrap().start();
-
-        let s1 = Mutex::new(PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        });
-        let (tx, _) = mpsc::unbounded_channel();
-        let h1 = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: s1.clone(),
-        };
-
-        let (tx, _) = mpsc::unbounded_channel();
-        let h2 = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-
-            consumer: tx,
-            inner: Mutex::new(PublishInner {
-                provides: Vec::new(),
-                subscribes: Vec::new(),
-                subscribers: HashMap::new(),
-            }),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            h1.on_link(h2).map_err(|e| {
-                dbg!(e);
-            })
-        }));
-
-        let subs = s1.try_lock().ok().unwrap();
-
-        let m1 = Message::Provide("/".into());
-        assert_eq!(subs.subscribers[&m1].len(), 1);
-
-        let m2 = Message::Revoke("/".into());
-        assert_eq!(subs.subscribers[&m2].len(), 1);
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    // XXX This function should mock the subscribe and unsubscribe functions. However as
-    // we can't yet return `impl Trait` from a Trait, we can't create a mock impl; it
-    // would require that every function returned a trait object instead.
-    // https://github.com/rust-lang/rfcs/pull/2515
-    #[test]
-    fn test_on_provide() {
-        RUNTIME.lock().unwrap().start();
-
-        let s1 = Mutex::new(PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        });
-        let (tx, _) = mpsc::unbounded_channel();
-        let h1 = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: s1.clone(),
-        };
-
-        let s2 = Mutex::new(PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        });
-        let (tx, _) = mpsc::unbounded_channel();
-        let h2 = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: s2.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            h1.on_provide("/a".into(), h2).map_err(|e| {
-                dbg!(e);
-            })
-        }));
-
-        let m1 = Message::Subscribe("/a".into());
-        let subs = s1.try_lock().unwrap();
-        assert_eq!(subs.subscribers[&m1].len(), 1);
-
-        let m2 = Message::Revoke("/a".into());
-        let subs = s2.try_lock().unwrap();
-        assert_eq!(subs.subscribers[&m2].len(), 1);
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    // XXX This function should mock the subscribe and unsubscribe functions. However as
-    // we can't yet return `impl Trait` from a Trait, we can't create a mock impl; it
-    // would require that every function returned a trait object instead.
-    // https://github.com/rust-lang/rfcs/pull/2515
-    #[test]
-    fn test_on_subscribe() {
-        RUNTIME.lock().unwrap().start();
-
-        let s1 = Mutex::new(PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        });
-        let (tx, _) = mpsc::unbounded_channel();
-        let h1 = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: s1.clone(),
-        };
-
-        let s2 = Mutex::new(PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        });
-        let (tx, _) = mpsc::unbounded_channel();
-        let h2 = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: s2.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            h1.on_subscribe("/a".into(), h2).map_err(|e| {
-                dbg!(e);
-            })
-        }));
-
-        let m2 = Message::Unsubscribe("/a".into());
-        let subs = s2.try_lock().ok().unwrap();
-        assert_eq!(subs.subscribers[&m2].len(), 1);
-
-        let m1 = Message::Event("/a".into(), String::new());
-        let subs = s1.try_lock().ok().unwrap();
-        assert_eq!(subs.subscribers[&m1].len(), 1);
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_subscribe() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-        let inner = Mutex::new(PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        });
-        let message = Message::Provide("/a".into());
-        let message_c = message.clone();
-        let handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        let (tx, mut rx) = oneshot::channel();
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            let (id, fut) = handle.subscribe(
-                message_c,
-                Subscriber::Task(Box::new(|_| Box::new(future::ok(())))),
-            );
-            tx.send(id).unwrap();
-            fut.map_err(|e| {
-                dbg!(e);
-            })
-        }));
-
-        let inn = inner.try_unwrap().ok().unwrap();
-        assert!(inn.subscribers[&message].contains_key(&rx.try_recv().unwrap()));
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_unsubscribe_single() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-
-        let mut pi = PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        };
-
-        let mut message_subs = HashMap::new();
-        let uuid = add_message_sub(&mut message_subs);
-        let message = add_message(Message::Provide("/a".into()), message_subs, &mut pi);
-        let message_c = message.clone();
-
-        let inner = Mutex::new(pi);
-
-        let handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            handle.unsubscribe(message, uuid).map_err(|e| {
-                dbg!(e);
-            })
-        }));
-
-        let inn = inner.try_unwrap().ok().unwrap();
-        assert!(!inn.subscribers.contains_key(&message_c));
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_unsubscribe_multiple() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-
-        let mut pi = PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        };
-
-        let mut message_subs = HashMap::new();
-        let uuid1 = add_message_sub(&mut message_subs);
-        let uuid2 = add_message_sub(&mut message_subs);
-        let message = add_message(Message::Provide("/a".into()), message_subs, &mut pi);
-        let message_c = message.clone();
-
-        let inner = Mutex::new(pi);
-
-        let handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            handle.unsubscribe(message, uuid1).map_err(|e| {
-                dbg!(e);
-            })
-        }));
-
-        let inn = inner.try_unwrap().ok().unwrap();
-        assert!(inn.subscribers.contains_key(&message_c));
-        assert!(!inn.subscribers[&message_c].contains_key(&uuid1));
-        assert!(inn.subscribers[&message_c].contains_key(&uuid2));
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_unsubscribe_children() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-
-        let mut pi = PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        };
-
-        let mut message_subs = HashMap::new();
-        add_message_sub(&mut message_subs);
-        let provide_a = add_message(Message::Provide("/a".into()), message_subs, &mut pi);
-
-        let mut message_subs = HashMap::new();
-        add_message_sub(&mut message_subs);
-        let provide_ab = add_message(Message::Provide("/a/b".into()), message_subs, &mut pi);
-
-        let mut message_subs = HashMap::new();
-        add_message_sub(&mut message_subs);
-        let provide_c = add_message(Message::Provide("/c".into()), message_subs, &mut pi);
-
-        let mut message_subs = HashMap::new();
-        add_message_sub(&mut message_subs);
-        let revoke_a = add_message(Message::Revoke("/a".into()), message_subs, &mut pi);
-
-        let inner = Mutex::new(pi);
-
-        let handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            handle
-                .unsubscribe_children(Message::Provide("/a".into()))
-                .map_err(|e| {
-                    dbg!(e);
-                })
-        }));
-
-        let inn = inner.try_unwrap().ok().unwrap();
-        assert!(!inn.subscribers.contains_key(&provide_a));
-        assert!(!inn.subscribers.contains_key(&provide_ab));
-        assert!(inn.subscribers.contains_key(&provide_c));
-        assert!(inn.subscribers.contains_key(&revoke_a));
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_route_none() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-
-        let mut pi = PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        };
-
-        let mut retain_subs = HashMap::new();
-        let (uuid, trigger) = add_message_sub_once_checked(&mut retain_subs);
-        let message = add_message(Message::Subscribe("/a".into()), retain_subs, &mut pi);
-
-        let inner = Mutex::new(pi);
-
-        let mut handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME.lock().unwrap().block_on(future::lazy(move || {
-            handle.route(Message::Provide("/b".into())).map_err(|_| ())
-        }));
-
-        // Check that the subscriber was not triggered
-        assert!(!*trigger.try_lock().ok().unwrap());
-
-        // Check that subscribers contains the message we expect to have retained
-        let inn = inner.try_lock().ok().unwrap();
-        assert_eq!(inn.subscribers[&message].len(), 1);
-        assert!(inn.subscribers[&message].contains_key(&uuid));
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_route_retain() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-
-        let mut pi = PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        };
-
-        // Susbcription to test retention for non-empty maps
-        let mut retain_subs = HashMap::new();
-        // This message should remain post `route()`
-        let (uuid_a, trigger_a) = add_message_sub_checked(&mut retain_subs);
-        // This message should be deleted during `route()`
-        let (_, trigger_b) = add_message_sub_once_checked(&mut retain_subs);
-        let message = add_message(Message::Subscribe("/a".into()), retain_subs, &mut pi);
-        let message_c = message.clone();
-
-        let inner = Mutex::new(pi);
-
-        let mut handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME
-            .lock()
-            .unwrap()
-            .block_on(future::lazy(move || handle.route(message).map_err(|_| ())));
-
-        // Check that the subscribers were triggered
-        assert!(*trigger_a.try_lock().ok().unwrap());
-        assert!(*trigger_b.try_lock().ok().unwrap());
-
-        // Check that subscribers contains the one message we expect to have retained
-        let inn = inner.try_lock().ok().unwrap();
-        assert_eq!(inn.subscribers[&message_c].len(), 1);
-        assert!(inn.subscribers[&message_c].contains_key(&uuid_a));
-
-        RUNTIME.lock().unwrap().stop();
-    }
-
-    #[test]
-    fn test_route_delete() {
-        RUNTIME.lock().unwrap().start();
-
-        let (tx, _) = mpsc::unbounded_channel();
-
-        let mut pi = PublishInner {
-            provides: Vec::new(),
-            subscribes: Vec::new(),
-            subscribers: HashMap::new(),
-        };
-
-        // Subscription to test deletion of empty maps
-        let mut delete_subs = HashMap::new();
-        let (_, trigger) = add_message_sub_once_checked(&mut delete_subs);
-        let message = add_message(Message::Unsubscribe("/b".into()), delete_subs, &mut pi);
-
-        let inner = Mutex::new(pi);
-
-        let mut handle = Publisher {
-            name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-            consumer: tx,
-            inner: inner.clone(),
-        };
-
-        // All this extra fluff around future::lazy() is necessary to ensure that there
-        // is an active executor when the fn calls Mutex::with().
-        RUNTIME
-            .lock()
-            .unwrap()
-            .block_on(future::lazy(move || handle.route(message).map_err(|_| ())));
-
-        // Check that the subscriber was triggered
-        assert!(*trigger.try_lock().ok().unwrap());
-
-        // Check that subscribers is empty
-        assert!(inner.try_lock().ok().unwrap().subscribers.is_empty());
-
-        RUNTIME.lock().unwrap().stop();
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use futures::future;
+//     use lazy_static::lazy_static;
+//     use tokio::{
+//         runtime::Runtime,
+//         sync::{mpsc, oneshot},
+//     };
+//
+//     use std::{
+//         net::{IpAddr, Ipv4Addr, SocketAddr},
+//         sync::Mutex as StdMutex,
+//     };
+//
+//     lazy_static! {
+//         static ref RUNTIME: StdMutex<TokioRuntime> = StdMutex::new(TokioRuntime::new());
+//     }
+//
+//     // Because each test requires a Tokio runtime, the test pack can exhaust the kernel's
+//     // file limit. To mitigate this issue, we use a shared runtime to limit the number of
+//     // open file descriptors.
+//     struct TokioRuntime {
+//         runtime: Option<Runtime>,
+//         users: u16,
+//     }
+//
+//     impl TokioRuntime {
+//         pub fn new() -> TokioRuntime {
+//             TokioRuntime {
+//                 runtime: None,
+//                 users: 0,
+//             }
+//         }
+//
+//         pub fn start(&mut self) {
+//             if self.runtime.is_none() {
+//                 self.runtime = Some(Runtime::new().unwrap());
+//             }
+//
+//             self.users += 1;
+//         }
+//
+//         pub fn stop(&mut self) {
+//             self.users -= 1;
+//
+//             if self.users == 0 && self.runtime.is_some() {
+//                 self.runtime
+//                     .take()
+//                     .unwrap()
+//                     .shutdown_on_idle()
+//                     .wait()
+//                     .unwrap();
+//             }
+//         }
+//
+//         pub fn block_on<F>(&mut self, future: F)
+//         where
+//             F: Send + 'static + Future<Item = (), Error = ()>,
+//         {
+//             self.runtime.as_mut().unwrap().block_on(future).unwrap();
+//         }
+//     }
+//
+//     fn add_message(
+//         message: Message,
+//         message_subs: HashMap<Uuid, Subscriber>,
+//         subs: &mut PublishInner,
+//     ) -> Message {
+//         let message_c = message.clone();
+//         subs.subscribers.insert(message, message_subs);
+//         message_c
+//     }
+//
+//     fn add_message_sub(map: &mut HashMap<Uuid, Subscriber>) -> Uuid {
+//         let uuid = Uuid::new_v4();
+//         map.insert(
+//             uuid,
+//             Subscriber::Task(Box::new(|_| Box::new(future::ok(())))),
+//         );
+//         uuid
+//     }
+//
+//     fn add_message_sub_checked(map: &mut HashMap<Uuid, Subscriber>) -> (Uuid, Mutex<bool>) {
+//         let uuid = Uuid::new_v4();
+//         let mutex = Mutex::new(false);
+//         let mutex_c = mutex.clone();
+//
+//         map.insert(
+//             uuid,
+//             Subscriber::Task(Box::new(move |_| {
+//                 Box::new(
+//                     mutex
+//                         .with(|mut guard| {
+//                             (*guard) = true;
+//                             future::ok(())
+//                         })
+//                         .unwrap(),
+//                 )
+//             })),
+//         );
+//         (uuid, mutex_c)
+//     }
+//
+//     fn add_message_sub_once_checked(map: &mut HashMap<Uuid, Subscriber>) -> (Uuid, Mutex<bool>) {
+//         let uuid = Uuid::new_v4();
+//         let mutex = Mutex::new(false);
+//         let mutex_c = mutex.clone();
+//
+//         map.insert(
+//             uuid,
+//             Subscriber::OnetimeTask(Some(Box::new(move |_| {
+//                 Box::new(
+//                     mutex
+//                         .with(|mut guard| {
+//                             (*guard) = true;
+//                             future::ok(())
+//                         })
+//                         .unwrap(),
+//                 )
+//             }))),
+//         );
+//         (uuid, mutex_c)
+//     }
+//
+//     // XXX This function should mock the subscribe and unsubscribe functions. However as
+//     // we can't yet return `impl Trait` from a Trait, we can't create a mock impl; it
+//     // would require that every function returned a trait object instead.
+//     // https://github.com/rust-lang/rfcs/pull/2515
+//     #[test]
+//     fn test_on_link() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let s1 = Mutex::new(PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         });
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let h1 = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: s1.clone(),
+//         };
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let h2 = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//
+//             consumer: tx,
+//             inner: Mutex::new(PublishInner {
+//                 provides: Vec::new(),
+//                 subscribes: Vec::new(),
+//                 subscribers: HashMap::new(),
+//             }),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             h1.on_link(h2).map_err(|e| {
+//                 dbg!(e);
+//             })
+//         }));
+//
+//         let subs = s1.try_lock().ok().unwrap();
+//
+//         let m1 = Message::Provide("/".into());
+//         assert_eq!(subs.subscribers[&m1].len(), 1);
+//
+//         let m2 = Message::Revoke("/".into());
+//         assert_eq!(subs.subscribers[&m2].len(), 1);
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     // XXX This function should mock the subscribe and unsubscribe functions. However as
+//     // we can't yet return `impl Trait` from a Trait, we can't create a mock impl; it
+//     // would require that every function returned a trait object instead.
+//     // https://github.com/rust-lang/rfcs/pull/2515
+//     #[test]
+//     fn test_on_provide() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let s1 = Mutex::new(PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         });
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let h1 = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: s1.clone(),
+//         };
+//
+//         let s2 = Mutex::new(PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         });
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let h2 = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: s2.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             h1.on_provide("/a".into(), h2).map_err(|e| {
+//                 dbg!(e);
+//             })
+//         }));
+//
+//         let m1 = Message::Subscribe("/a".into());
+//         let subs = s1.try_lock().unwrap();
+//         assert_eq!(subs.subscribers[&m1].len(), 1);
+//
+//         let m2 = Message::Revoke("/a".into());
+//         let subs = s2.try_lock().unwrap();
+//         assert_eq!(subs.subscribers[&m2].len(), 1);
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     // XXX This function should mock the subscribe and unsubscribe functions. However as
+//     // we can't yet return `impl Trait` from a Trait, we can't create a mock impl; it
+//     // would require that every function returned a trait object instead.
+//     // https://github.com/rust-lang/rfcs/pull/2515
+//     #[test]
+//     fn test_on_subscribe() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let s1 = Mutex::new(PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         });
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let h1 = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: s1.clone(),
+//         };
+//
+//         let s2 = Mutex::new(PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         });
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let h2 = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: s2.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             h1.on_subscribe("/a".into(), h2).map_err(|e| {
+//                 dbg!(e);
+//             })
+//         }));
+//
+//         let m2 = Message::Unsubscribe("/a".into());
+//         let subs = s2.try_lock().ok().unwrap();
+//         assert_eq!(subs.subscribers[&m2].len(), 1);
+//
+//         let m1 = Message::Event("/a".into(), String::new());
+//         let subs = s1.try_lock().ok().unwrap();
+//         assert_eq!(subs.subscribers[&m1].len(), 1);
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_subscribe() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//         let inner = Mutex::new(PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         });
+//         let message = Message::Provide("/a".into());
+//         let message_c = message.clone();
+//         let handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         let (tx, mut rx) = oneshot::channel();
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             let (id, fut) = handle.subscribe(
+//                 message_c,
+//                 Subscriber::Task(Box::new(|_| Box::new(future::ok(())))),
+//             );
+//             tx.send(id).unwrap();
+//             fut.map_err(|e| {
+//                 dbg!(e);
+//             })
+//         }));
+//
+//         let inn = inner.try_unwrap().ok().unwrap();
+//         assert!(inn.subscribers[&message].contains_key(&rx.try_recv().unwrap()));
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_unsubscribe_single() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//
+//         let mut pi = PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         };
+//
+//         let mut message_subs = HashMap::new();
+//         let uuid = add_message_sub(&mut message_subs);
+//         let message = add_message(Message::Provide("/a".into()), message_subs, &mut pi);
+//         let message_c = message.clone();
+//
+//         let inner = Mutex::new(pi);
+//
+//         let handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             handle.unsubscribe(message, uuid).map_err(|e| {
+//                 dbg!(e);
+//             })
+//         }));
+//
+//         let inn = inner.try_unwrap().ok().unwrap();
+//         assert!(!inn.subscribers.contains_key(&message_c));
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_unsubscribe_multiple() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//
+//         let mut pi = PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         };
+//
+//         let mut message_subs = HashMap::new();
+//         let uuid1 = add_message_sub(&mut message_subs);
+//         let uuid2 = add_message_sub(&mut message_subs);
+//         let message = add_message(Message::Provide("/a".into()), message_subs, &mut pi);
+//         let message_c = message.clone();
+//
+//         let inner = Mutex::new(pi);
+//
+//         let handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             handle.unsubscribe(message, uuid1).map_err(|e| {
+//                 dbg!(e);
+//             })
+//         }));
+//
+//         let inn = inner.try_unwrap().ok().unwrap();
+//         assert!(inn.subscribers.contains_key(&message_c));
+//         assert!(!inn.subscribers[&message_c].contains_key(&uuid1));
+//         assert!(inn.subscribers[&message_c].contains_key(&uuid2));
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_unsubscribe_children() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//
+//         let mut pi = PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         };
+//
+//         let mut message_subs = HashMap::new();
+//         add_message_sub(&mut message_subs);
+//         let provide_a = add_message(Message::Provide("/a".into()), message_subs, &mut pi);
+//
+//         let mut message_subs = HashMap::new();
+//         add_message_sub(&mut message_subs);
+//         let provide_ab = add_message(Message::Provide("/a/b".into()), message_subs, &mut pi);
+//
+//         let mut message_subs = HashMap::new();
+//         add_message_sub(&mut message_subs);
+//         let provide_c = add_message(Message::Provide("/c".into()), message_subs, &mut pi);
+//
+//         let mut message_subs = HashMap::new();
+//         add_message_sub(&mut message_subs);
+//         let revoke_a = add_message(Message::Revoke("/a".into()), message_subs, &mut pi);
+//
+//         let inner = Mutex::new(pi);
+//
+//         let handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             handle
+//                 .unsubscribe_children(Message::Provide("/a".into()))
+//                 .map_err(|e| {
+//                     dbg!(e);
+//                 })
+//         }));
+//
+//         let inn = inner.try_unwrap().ok().unwrap();
+//         assert!(!inn.subscribers.contains_key(&provide_a));
+//         assert!(!inn.subscribers.contains_key(&provide_ab));
+//         assert!(inn.subscribers.contains_key(&provide_c));
+//         assert!(inn.subscribers.contains_key(&revoke_a));
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_route_none() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//
+//         let mut pi = PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         };
+//
+//         let mut retain_subs = HashMap::new();
+//         let (uuid, trigger) = add_message_sub_once_checked(&mut retain_subs);
+//         let message = add_message(Message::Subscribe("/a".into()), retain_subs, &mut pi);
+//
+//         let inner = Mutex::new(pi);
+//
+//         let mut handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME.lock().unwrap().block_on(future::lazy(move || {
+//             handle.route(Message::Provide("/b".into())).map_err(|_| ())
+//         }));
+//
+//         // Check that the subscriber was not triggered
+//         assert!(!*trigger.try_lock().ok().unwrap());
+//
+//         // Check that subscribers contains the message we expect to have retained
+//         let inn = inner.try_lock().ok().unwrap();
+//         assert_eq!(inn.subscribers[&message].len(), 1);
+//         assert!(inn.subscribers[&message].contains_key(&uuid));
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_route_retain() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//
+//         let mut pi = PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         };
+//
+//         // Susbcription to test retention for non-empty maps
+//         let mut retain_subs = HashMap::new();
+//         // This message should remain post `route()`
+//         let (uuid_a, trigger_a) = add_message_sub_checked(&mut retain_subs);
+//         // This message should be deleted during `route()`
+//         let (_, trigger_b) = add_message_sub_once_checked(&mut retain_subs);
+//         let message = add_message(Message::Subscribe("/a".into()), retain_subs, &mut pi);
+//         let message_c = message.clone();
+//
+//         let inner = Mutex::new(pi);
+//
+//         let mut handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME
+//             .lock()
+//             .unwrap()
+//             .block_on(future::lazy(move || handle.route(message).map_err(|_| ())));
+//
+//         // Check that the subscribers were triggered
+//         assert!(*trigger_a.try_lock().ok().unwrap());
+//         assert!(*trigger_b.try_lock().ok().unwrap());
+//
+//         // Check that subscribers contains the one message we expect to have retained
+//         let inn = inner.try_lock().ok().unwrap();
+//         assert_eq!(inn.subscribers[&message_c].len(), 1);
+//         assert!(inn.subscribers[&message_c].contains_key(&uuid_a));
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+//
+//     #[test]
+//     fn test_route_delete() {
+//         RUNTIME.lock().unwrap().start();
+//
+//         let (tx, _) = mpsc::unbounded_channel();
+//
+//         let mut pi = PublishInner {
+//             provides: Vec::new(),
+//             subscribes: Vec::new(),
+//             subscribers: HashMap::new(),
+//         };
+//
+//         // Subscription to test deletion of empty maps
+//         let mut delete_subs = HashMap::new();
+//         let (_, trigger) = add_message_sub_once_checked(&mut delete_subs);
+//         let message = add_message(Message::Unsubscribe("/b".into()), delete_subs, &mut pi);
+//
+//         let inner = Mutex::new(pi);
+//
+//         let mut handle = Publisher {
+//             name: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+//             consumer: tx,
+//             inner: inner.clone(),
+//         };
+//
+//         // All this extra fluff around future::lazy() is necessary to ensure that there
+//         // is an active executor when the fn calls Mutex::with().
+//         RUNTIME
+//             .lock()
+//             .unwrap()
+//             .block_on(future::lazy(move || handle.route(message).map_err(|_| ())));
+//
+//         // Check that the subscriber was triggered
+//         assert!(*trigger.try_lock().ok().unwrap());
+//
+//         // Check that subscribers is empty
+//         assert!(inner.try_lock().ok().unwrap().subscribers.is_empty());
+//
+//         RUNTIME.lock().unwrap().stop();
+//     }
+// }
