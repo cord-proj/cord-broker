@@ -91,5 +91,5 @@ jobs:
       - name: Test build Dockerfile
         uses: docker/build-push-action@v1
         with:
-          repository: cordproj/cord-client
+          repository: cordproj/cord-broker
           push: false
