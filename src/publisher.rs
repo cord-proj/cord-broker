@@ -1,7 +1,7 @@
 use crate::{errors::*, subscriber::Subscriber};
 use cord_message::{Message, Pattern};
-use futures::{self, future, Future, FutureExt};
-use futures_locks_pre::Mutex;
+use futures::{self, future, FutureExt};
+use futures_locks::Mutex;
 use log::debug;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -46,72 +46,72 @@ impl Publisher {
     }
 
     // Link two publishers together so that they can subscribe to each other's streams
-    pub fn link(&self, other: &Publisher) -> impl Future<Item = (), Error = Error> {
+    pub async fn link(&self, other: &Publisher) {
         debug!(target: "publisher", "Link {} with {}", self, other);
 
         let me = self.clone();
         let me_two = self.clone();
+        let me_three = me_two.clone();
         let you = other.clone();
         let you_two = other.clone();
 
         // Link publishers
-        let join = self.on_link(you).join(other.on_link(me)).map(|_| ());
+        future::join(self.on_link(you), other.on_link(me)).await;
 
         // Replay PROVIDE messages for new joiner
-        join.and_then(move |_| {
-            let me_three = me_two.clone();
-
-            me_two
-                .inner
-                .with(move |guard| {
-                    let mut futs = Vec::new();
-                    (*guard).provides.iter().for_each(|p| {
-                        debug!(target: "publisher", "Replay {:?} for new joiner", p);
-                        futs.push(you_two.on_provide(p.clone(), me_three.clone()));
-                    });
-                    future::join_all(futs).map(|_| ())
-                })
-                .expect("The default executor has shut down")
-        })
+        me_two
+            .inner
+            .with(move |guard| {
+                let mut futs = Vec::new();
+                (*guard).provides.iter().for_each(|p| {
+                    debug!(target: "publisher", "Replay {:?} for new joiner", p);
+                    futs.push(you_two.on_provide(p.clone(), me_three.clone()));
+                });
+                future::join_all(futs)
+            })
+            .await;
     }
 
     // Helper function for subscribing another publisher to our PROVIDE and REVOKE
     // messages
-    fn on_link(&self, other: Publisher) -> impl Future<Item = (), Error = Error> {
+    async fn on_link(&self, other: Publisher) {
         let me = self.clone();
         let me_two = self.clone();
 
         // Subscribe to PROVIDE messages
-        let (_, futp) = self.subscribe(
+        self.subscribe(
             Message::Provide("/".into()),
             Subscriber::Task(Box::new(move |message| {
-                Box::new(other.on_provide(message.unwrap_provide(), me.clone()))
+                Box::new(
+                    other
+                        .on_provide(message.unwrap_provide(), me.clone())
+                        .map(|_| Ok(())),
+                )
             })),
-        );
+        )
+        .await;
 
         // Subscribe to REVOKE messages
         // We use this task to bulk-remove all subscribers that have subscribed to the
         // revoked namespace.
-        let (_, futr) =
-            self.subscribe(
-                Message::Revoke("/".into()),
-                Subscriber::Task(Box::new(move |message| {
-                    Box::new(me_two.unsubscribe_children(Message::Event(
-                        message.unwrap_revoke(),
-                        String::new(),
-                    )))
-                })),
-            );
-
-        futp.join(futr).map(|_| ())
+        self.subscribe(
+            Message::Revoke("/".into()),
+            Subscriber::Task(Box::new(move |message| {
+                Box::new(
+                    me_two
+                        .unsubscribe_children(Message::Event(
+                            message.unwrap_revoke(),
+                            String::new(),
+                        ))
+                        .map(|_| Ok(())),
+                )
+            })),
+        )
+        .await;
     }
 
     // Helper function for subscribing another publisher to our SUBSCRIBE messages
-    fn on_provide(
-        &self,
-        namespace: Pattern,
-        other: Publisher,
-    ) -> impl Future<Item = (), Error = Error> {
+    async fn on_provide(&self, namespace: Pattern, other: Publisher) {
         let me = self.clone();
         let me_two = self.clone();
         let me_three = self.clone();
@@ -125,101 +125,106 @@ impl Publisher {
         // the other publisher provides /a, forward our client's request to the other
         // publisher. The other publisher will then start sending /a messages to our
         // client.
-        let (uuid, futs) = self.subscribe(
-            Message::Subscribe(namespace),
-            Subscriber::Task(Box::new(move |message| {
-                Box::new(other.on_subscribe(message.unwrap_subscribe(), me_two.clone()))
-            })),
-        );
+        let uuid = self
+            .subscribe(
+                Message::Subscribe(namespace),
+                Subscriber::Task(Box::new(move |message| {
+                    Box::new(
+                        other
+                            .on_subscribe(message.unwrap_subscribe(), me_two.clone())
+                            .map(|_| Ok(())),
+                    )
+                })),
+            )
+            .await;
 
         // Add a subscription for any REVOKE messages from the other publisher. If the
         // other provider revokes the namespace, we don't want to keep listening for
         // SUBSCRIBE messages to it.
-        let (_, futr) = you_two.subscribe(
-            Message::Revoke(namespace_two),
-            Subscriber::OnetimeTask(Some(Box::new(move |message| {
-                Box::new(me.unsubscribe(Message::Subscribe(message.unwrap_revoke()), uuid))
-            }))),
-        );
+        you_two
+            .subscribe(
+                Message::Revoke(namespace_two),
+                Subscriber::OnetimeTask(Some(Box::new(move |message| {
+                    Box::new(
+                        me.unsubscribe(Message::Subscribe(message.unwrap_revoke()), uuid)
+                            .map(|_| Ok(())),
+                    )
+                }))),
+            )
+            .await;
 
         // Replay SUBSCRIBE messages received prior to this PROVIDE
-        let futp = self.inner.with(move |guard| {
-            let mut futs = Vec::new();
-            (*guard)
-                .subscribes
-                .iter()
-                .filter(|s| namespace_three.contains(s))
-                .for_each(|s| {
-                    debug!(target: "publisher", "Replay {:?} for new provide", s);
-                    futs.push(you_three.on_subscribe(s.clone(), me_three.clone()));
-                });
-            future::join_all(futs).map(|_| ())
-        });
-
-        futs.join(futr)
-            .join(futp.map_err(|e| ErrorKind::Msg(e.to_string()).into()))
-            .map(|_| ())
+        self.inner
+            .with(move |guard| {
+                let mut futs = Vec::new();
+                (*guard)
+                    .subscribes
+                    .iter()
+                    .filter(|s| namespace_three.contains(s))
+                    .for_each(|s| {
+                        debug!(target: "publisher", "Replay {:?} for new provide", s);
+                        futs.push(you_three.on_subscribe(s.clone(), me_three.clone()));
+                    });
+                future::join_all(futs).map(|_| ())
+            })
+            .await;
     }
 
     // Helper function for subscribing another publisher's consumer to our EVENT messages
-    fn on_subscribe(
-        &self,
-        namespace: Pattern,
-        other: Publisher,
-    ) -> impl Future<Item = (), Error = Error> {
+    async fn on_subscribe(&self, namespace: Pattern, other: Publisher) {
         let me = self.clone();
         let namespace_clone = namespace.clone();
         let consumer = other.consumer.clone();
 
         // Subscribe a consumer to our EVENT messages matching `namespace`
-        let (uuid, fute) = self.subscribe(
-            Message::Event(namespace, String::new()),
-            Subscriber::Consumer(consumer),
-        );
+        let uuid = self
+            .subscribe(
+                Message::Event(namespace, String::new()),
+                Subscriber::Consumer(consumer),
+            )
+            .await;
 
         // Add a subscription for any UNSUBSCRIBE messages from the other publisher. If
         // the other publisher receives a request to unsubscribe this namespace, the task
         // below will trigger it.
-        let (_, futu) = other.subscribe(
-            Message::Unsubscribe(namespace_clone),
-            Subscriber::OnetimeTask(Some(Box::new(move |message| {
-                Box::new(me.unsubscribe(
-                    Message::Event(message.unwrap_unsubscribe(), String::new()),
-                    uuid,
-                ))
-            }))),
-        );
-
-        fute.join(futu).map(|_| ())
+        other
+            .subscribe(
+                Message::Unsubscribe(namespace_clone),
+                Subscriber::OnetimeTask(Some(Box::new(move |message| {
+                    Box::new(
+                        me.unsubscribe(
+                            Message::Event(message.unwrap_unsubscribe(), String::new()),
+                            uuid,
+                        )
+                        .map(|_| Ok(())),
+                    )
+                }))),
+            )
+            .await;
     }
 
     // Add a Subscriber for a specific Message to our subscriber list
-    fn subscribe(
-        &self,
-        message: Message,
-        subscriber: Subscriber,
-    ) -> (Uuid, impl Future<Item = (), Error = Error>) {
+    async fn subscribe(&self, message: Message, subscriber: Subscriber) -> Uuid {
         let uuid = Uuid::new_v4();
 
         debug!(target: "publisher", "Subscribe {} to {:?} for {}", uuid, message, self);
 
-        (
-            uuid,
-            self.inner
-                .with(move |mut guard| {
-                    (*guard)
-                        .subscribers
-                        .entry(message)
-                        .or_insert_with(HashMap::new)
-                        .insert(uuid, subscriber);
-                    future::ok(())
-                })
-                .expect("The default executor has shut down"),
-        )
+        self.inner
+            .with(move |mut guard| {
+                (*guard)
+                    .subscribers
+                    .entry(message)
+                    .or_insert_with(HashMap::new)
+                    .insert(uuid, subscriber);
+                future::ready(())
+            })
+            .await;
+
+        uuid
     }
 
     // Remove a Subscriber for a specific Message from our subscriber list
-    fn unsubscribe(&self, message: Message, sub_id: Uuid) -> impl Future<Item = (), Error = Error> {
+    async fn unsubscribe(&self, message: Message, sub_id: Uuid) {
         debug!(target: "publisher", "Unsubscribe {} from {:?} for {}", sub_id, message, self);
 
         self.inner
@@ -234,24 +239,23 @@ impl Publisher {
                         o.remove();
                     }
                 }
-
-                future::ok(())
+                future::ready(())
             })
-            .expect("The default executor has shut down")
+            .await;
     }
 
     // Remove all Subscribers that are are contained within a broader namespace.
     // For example: Subscribe(/a) contains Subscribe(/a/b), so Subscribe(/a/b) would be
     // removed.
-    fn unsubscribe_children(&self, message: Message) -> impl Future<Item = (), Error = Error> {
+    async fn unsubscribe_children(&self, message: Message) {
         debug!(target: "publisher", "Unsubscribe everyone from {:?} for {}", message, self);
 
         self.inner
             .with(move |mut guard| {
                 (*guard).subscribers.retain(|k, _| !message.contains(&k));
-                future::ok(())
+                future::ready(())
             })
-            .expect("The default executor has shut down")
+            .await;
     }
 
     // Route a message to all interested subscribers, making sure we clean up any
@@ -276,28 +280,28 @@ impl Publisher {
 
                 debug!("Received message {:?} from {}", message, name);
 
-                let mut futs = vec![];
+                // let mut futs = vec![];
 
-                for (sub_msg, subs) in (*guard).subscribers {
-                    if sub_msg.contains(&message) {
-                        debug!("Subscriber {:?} matches {:?}", sub_msg, message);
+                // for (sub_msg, subs) in (*guard).subscribers {
+                //     if sub_msg.contains(&message) {
+                //         debug!("Subscriber {:?} matches {:?}", sub_msg, message);
 
-                        let mut needs_gc = false;
+                //         let mut needs_gc = false;
 
-                        // We use retain() here, which allows us to cleanup any
-                        // subscribers that have OnetimeTask's or whose channels
-                        // have been closed.
-                        for (_, sub) in subs async {
-                            needs_gc = sub.recv(message.clone()).await;
-                        }
+                //         // We use retain() here, which allows us to cleanup any
+                //         // subscribers that have OnetimeTask's or whose channels
+                //         // have been closed.
+                //         for (_, sub) in subs async {
+                //             needs_gc = sub.recv(message.clone()).await;
+                //         }
 
-                        subs.retain(|_, sub| async { sub.recv(message.clone()).await });
-                        !subs.is_empty() // Retain if map contains subscribers
-                    } else {
-                        debug!("Subscriber {:?} does not match {:?}", sub_msg, message);
-                        true // Retain as we haven't modified the map
-                    }
-                }
+                //         subs.retain(|_, sub| async { sub.recv(message.clone()).await });
+                //         !subs.is_empty() // Retain if map contains subscribers
+                //     } else {
+                //         debug!("Subscriber {:?} does not match {:?}", sub_msg, message);
+                //         true // Retain as we haven't modified the map
+                //     }
+                // }
 
                 // In the inner loop we may cleanup all of the subscribers in the
                 // `subs` map. This leaves us with an empty map that should also
@@ -316,7 +320,8 @@ impl Publisher {
                 //     }
                 // });
 
-                future::join_all(futs).map(|_| ())
+                // future::join_all(futs).map(|_| ())
+                future::ready(())
             })
             .await
     }

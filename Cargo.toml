@@ -21,12 +21,14 @@ cord-message = "0.2"
 env_logger = "0.7"
 error-chain = "0.12"
 futures = "0.3"
-futures-locks-pre = "0.5.1-pre"
+#futures-locks = "0.5"
+futures-locks = { git = "https://github.com/asomers/futures-locks.git" }
 log = "0.4"
-tokio = "0.2"
+tokio = { version = "0.2", features = [ "io-std", "io-util", "macros", "rt-threaded", "sync", "tcp" ] }
+tokio-util = { version = "0.3", features = [ "codec" ] }
 uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
-cord-client = "0.2"
+#cord-client = "0.2"
 cord-message = "0.2"
 lazy_static = "1.4"
