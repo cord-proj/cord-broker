@@ -1,4 +1,4 @@
-use crate::{errors::*, subscriber::Subscriber};
+use crate::subscriber::{Consumer, OnetimeTask, Subscriber, Task};
 use cord_message::{Message, Pattern};
 use futures::{self, future, FutureExt};
 use futures_locks::Mutex;
@@ -23,7 +23,7 @@ pub struct Publisher {
 pub struct PublishInner {
     provides: Vec<Pattern>,
     subscribes: Vec<Pattern>,
-    subscribers: HashMap<Message, HashMap<Uuid, Subscriber>>,
+    subscribers: HashMap<Message, HashMap<Uuid, Box<dyn Subscriber + Send>>>,
 }
 
 impl fmt::Display for Publisher {
@@ -81,13 +81,10 @@ impl Publisher {
         // Subscribe to PROVIDE messages
         self.subscribe(
             Message::Provide("/".into()),
-            Subscriber::Task(Box::new(move |message| {
-                Box::new(
-                    other
-                        .on_provide(message.unwrap_provide(), me.clone())
-                        .map(|_| Ok(())),
-                )
-            })),
+            Task(move |message| async {
+                let o = other.clone();
+                o.on_provide(message.unwrap_provide(), me.clone()).await;
+            }),
         )
         .await;
 
@@ -96,16 +93,9 @@ impl Publisher {
         // revoked namespace.
         self.subscribe(
             Message::Revoke("/".into()),
-            Subscriber::Task(Box::new(move |message| {
-                Box::new(
-                    me_two
-                        .unsubscribe_children(Message::Event(
-                            message.unwrap_revoke(),
-                            String::new(),
-                        ))
-                        .map(|_| Ok(())),
-                )
-            })),
+            Task(move |message| async {
+                me_two.unsubscribe_children(Message::Event(message.unwrap_revoke(), String::new()))
+            }),
         )
         .await;
     }
@@ -128,13 +118,9 @@ impl Publisher {
         let uuid = self
             .subscribe(
                 Message::Subscribe(namespace),
-                Subscriber::Task(Box::new(move |message| {
-                    Box::new(
-                        other
-                            .on_subscribe(message.unwrap_subscribe(), me_two.clone())
-                            .map(|_| Ok(())),
-                    )
-                })),
+                Task(move |message| async {
+                    other.on_subscribe(message.unwrap_subscribe(), me_two.clone())
+                }),
             )
             .await;
 
@@ -144,12 +130,9 @@ impl Publisher {
         you_two
             .subscribe(
                 Message::Revoke(namespace_two),
-                Subscriber::OnetimeTask(Some(Box::new(move |message| {
-                    Box::new(
-                        me.unsubscribe(Message::Subscribe(message.unwrap_revoke()), uuid)
-                            .map(|_| Ok(())),
-                    )
-                }))),
+                OnetimeTask(Some(move |message: Message| async {
+                    me.unsubscribe(Message::Subscribe(message.unwrap_revoke()), uuid)
+                })),
             )
             .await;
 
@@ -178,10 +161,7 @@ impl Publisher {
 
         // Subscribe a consumer to our EVENT messages matching `namespace`
         let uuid = self
-            .subscribe(
-                Message::Event(namespace, String::new()),
-                Subscriber::Consumer(consumer),
-            )
+            .subscribe(Message::Event(namespace, String::new()), Consumer(consumer))
             .await;
 
         // Add a subscription for any UNSUBSCRIBE messages from the other publisher. If
@@ -190,21 +170,21 @@ impl Publisher {
         other
             .subscribe(
                 Message::Unsubscribe(namespace_clone),
-                Subscriber::OnetimeTask(Some(Box::new(move |message| {
-                    Box::new(
-                        me.unsubscribe(
-                            Message::Event(message.unwrap_unsubscribe(), String::new()),
-                            uuid,
-                        )
-                        .map(|_| Ok(())),
+                OnetimeTask(Some(move |message: Message| async {
+                    me.unsubscribe(
+                        Message::Event(message.unwrap_unsubscribe(), String::new()),
+                        uuid,
                     )
-                }))),
+                })),
             )
             .await;
     }
 
     // Add a Subscriber for a specific Message to our subscriber list
-    async fn subscribe(&self, message: Message, subscriber: Subscriber) -> Uuid {
+    async fn subscribe<S>(&self, message: Message, subscriber: S) -> Uuid
+    where
+        S: Subscriber + Send + 'static,
+    {
         let uuid = Uuid::new_v4();
 
         debug!(target: "publisher", "Subscribe {} to {:?} for {}", uuid, message, self);
@@ -215,7 +195,7 @@ impl Publisher {
                     .subscribers
                     .entry(message)
                     .or_insert_with(HashMap::new)
-                    .insert(uuid, subscriber);
+                    .insert(uuid, Box::new(subscriber));
                 future::ready(())
             })
             .await;

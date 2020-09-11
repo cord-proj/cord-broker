@@ -16,6 +16,7 @@ categories = ["network-programming", "data-structures"]
 include = ["src/**/*"]
 
 [dependencies]
+async-trait = "0.1"
 clap = "2.33"
 cord-message = "0.2"
 env_logger = "0.7"
