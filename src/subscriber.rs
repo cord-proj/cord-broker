@@ -61,12 +61,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future;
     use tokio::sync::{mpsc, oneshot};
 
     #[tokio::test]
     async fn test_subscriber_recv_consumer() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let message = Message::Event("/a".into(), "abc".into());
         let message_c = message.clone();
 
@@ -79,13 +78,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscriber_recv_task() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let message = Message::Event("/a".into(), "abc".into());
         let message_c = message.clone();
 
-        let mut consumer = Task(move |msg| async {
+        let mut consumer = Task(|msg| async {
             tx.send(msg).unwrap();
-            future::ready(())
         });
         let retain = consumer.recv(message).await;
         assert!(retain);
@@ -95,13 +93,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscriber_recv_onetime_task() {
-        let (tx, mut rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let message = Message::Event("/a".into(), "abc".into());
         let message_c = message.clone();
 
-        let mut consumer = OnetimeTask(Some(move |msg| async {
+        let mut consumer = OnetimeTask(Some(|msg| async {
             tx.send(msg).unwrap();
-            future::ready(()).await;
         }));
 
         consumer.recv(message).await;

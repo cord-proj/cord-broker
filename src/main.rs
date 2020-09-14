@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         .expect("Port must be an integer");
     // `unwrap()` is safe as a default value will always be available
     let addr: IpAddr = matches.value_of("bind").unwrap().trim().parse().unwrap();
-    let listener = TcpListener::bind((addr, port)).await?;
+    let mut listener = TcpListener::bind((addr, port)).await?;
 
     // If port is set to 0, the user wants us to bind to a random port. It would be
     // neighbourly to tell them what we've bound to!
@@ -84,29 +84,31 @@ async fn main() -> Result<()> {
                 let subscriber = sink_to_channel(sink);
 
                 // Create a clonable publisher handle so we can control the publisher from afar
-                let mut handle = Publisher::new(addr, subscriber);
-                let newbie = handle.clone();
+                let publisher = Publisher::new(addr, subscriber);
 
                 // Introduce the newbie to all the other publishers. This allows each
                 // publisher to subscribe to the other publishers' SUBSCRIBE events. This
                 // is important for facilitating subscriptions between consumers of
                 // different publishers.
                 let mut futs = Vec::new();
-                for publisher in publishers.iter() {
-                    futs.push(publisher.link(&newbie));
+                for p in publishers.iter() {
+                    futs.push(p.link(publisher.clone()));
                 }
+                future::join_all(futs).await;
 
                 // This is the main routing task. For each message we receive, find all the
                 // subscribers that match it, then pass each a copy via `recv()`.
-                tokio::spawn(future::join_all(futs).then(|_| {
+                tokio::spawn(
                     stream
-                        // .map_err(|e| errors::ErrorKind::Message(e).into())
-                        .try_fold(handle, |h, m| h.route(m).map(|_| Ok(h)))
-                        .map_err(|e| error!("{}", e))
-                }));
+                        .try_fold(publisher.clone(), |mut p, m| async {
+                            p.route(m).await;
+                            Ok(p)
+                        })
+                        .map_err(|e| error!("{}", e)),
+                );
 
                 // Finally, add the newbie to the list of existing publishers
-                publishers.push(newbie);
+                publishers.push(publisher);
             }
             Err(e) => error!("Could not accept incoming connection: {}", e),
         }

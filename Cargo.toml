@@ -22,8 +22,7 @@ cord-message = "0.2"
 env_logger = "0.7"
 error-chain = "0.12"
 futures = "0.3"
-#futures-locks = "0.5"
-futures-locks = { git = "https://github.com/asomers/futures-locks.git" }
+futures-locks = "0.6"
 log = "0.4"
 tokio = { version = "0.2", features = [ "io-std", "io-util", "macros", "rt-threaded", "sync", "tcp" ] }
 tokio-util = { version = "0.3", features = [ "codec" ] }
