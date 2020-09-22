@@ -46,63 +46,50 @@ impl Publisher {
     }
 
     // Link two publishers together so that they can subscribe to each other's streams
-    pub async fn link(&self, other: Publisher) {
+    pub async fn link(&self, other: &Publisher) {
         debug!(target: "publisher", "Link {} with {}", self, other);
 
-        let me = self.clone();
-        let me_two = self.clone();
-        let me_three = me_two.clone();
-        let you = other.clone();
-        let you_two = other.clone();
-
         // Link publishers
-        future::join(self.on_link(you), other.on_link(me)).await;
+        future::join(self.on_link(other), other.on_link(self)).await;
 
         // Replay PROVIDE messages for new joiner
-        // me_two
-        //     .inner
-        //     .with(move |guard| {
-        //         let mut futs = Vec::new();
-        //         (*guard).provides.iter().for_each(|p| {
-        //             debug!(target: "publisher", "Replay {:?} for new joiner", p);
-        //             futs.push(you_two.on_provide(p.clone(), me_three.clone()));
-        //         });
-        //         future::join_all(futs)
-        //     })
-        //     .await;
+        let mut futs = Vec::new();
+        let guard = self.inner.lock().await;
+        (*guard).provides.iter().for_each(|p| {
+            debug!(target: "publisher", "Replay {:?} for new joiner", p);
+            futs.push(other.on_provide(p.clone(), &self));
+        });
+        future::join_all(futs).await;
     }
 
     // Helper function for subscribing another publisher to our PROVIDE and REVOKE
     // messages
-    async fn on_link(&self, other: Publisher) {}
+    async fn on_link(&self, other: &Publisher) {
+        let other1 = other.clone();
+        let other2 = other.clone();
+        // Subscribe to PROVIDE messages
+        self.subscribe(
+            Message::Provide("/".into()),
+            Task(|publisher: &_, message| async {
+                other1.on_provide(message.unwrap_provide(), publisher)
+            }),
+        )
+        .await;
 
-    //         let me = self.clone();
-    //         let me_two = self.clone();
-
-    //         // Subscribe to PROVIDE messages
-    //         self.subscribe(
-    //             Message::Provide("/".into()),
-    //             Task(move |message| async {
-    //                 let o = other.clone();
-    //                 o.on_provide(message.unwrap_provide(), me.clone()).await;
-    //             }),
-    //         )
-    //         .await;
-
-    //         // Subscribe to REVOKE messages
-    //         // We use this task to bulk-remove all subscribers that have subscribed to the
-    //         // revoked namespace.
-    //         self.subscribe(
-    //             Message::Revoke("/".into()),
-    //             Task(move |message| async {
-    //                 me_two.unsubscribe_children(Message::Event(message.unwrap_revoke(), String::new()))
-    //             }),
-    //         )
-    //         .await;
-    //     }
+        // Subscribe to REVOKE messages
+        // We use this task to bulk-remove all subscribers that have subscribed to the
+        // revoked namespace.
+        // self.subscribe(
+        //     Message::Revoke("/".into()),
+        //     Task(move |message| async {
+        //         me_two.unsubscribe_children(Message::Event(message.unwrap_revoke(), String::new()))
+        //     }),
+        // )
+        // .await;
+    }
 
     //     // Helper function for subscribing another publisher to our SUBSCRIBE messages
-    //     async fn on_provide(&self, namespace: Pattern, other: Publisher) {
+    async fn on_provide(&self, namespace: Pattern, other: &Publisher) {}
     //         let me = self.clone();
     //         let me_two = self.clone();
     //         let me_three = self.clone();
@@ -181,28 +168,28 @@ impl Publisher {
     //             .await;
     //     }
 
-    //     // Add a Subscriber for a specific Message to our subscriber list
-    //     async fn subscribe<S>(&self, message: Message, subscriber: S) -> Uuid
-    //     where
-    //         S: Subscriber + Send + 'static,
-    //     {
-    //         let uuid = Uuid::new_v4();
+    // Add a Subscriber for a specific Message to our subscriber list
+    async fn subscribe<S>(&self, message: Message, subscriber: S) -> Uuid
+    where
+        S: Subscriber + Send + 'static,
+    {
+        let uuid = Uuid::new_v4();
 
-    //         debug!(target: "publisher", "Subscribe {} to {:?} for {}", uuid, message, self);
+        debug!(target: "publisher", "Subscribe {} to {:?} for {}", uuid, message, self);
 
-    //         self.inner
-    //             .with(move |mut guard| {
-    //                 (*guard)
-    //                     .subscribers
-    //                     .entry(message)
-    //                     .or_insert_with(HashMap::new)
-    //                     .insert(uuid, Box::new(subscriber));
-    //                 future::ready(())
-    //             })
-    //             .await;
+        self.inner
+            .with(move |mut guard| {
+                (*guard)
+                    .subscribers
+                    .entry(message)
+                    .or_insert_with(HashMap::new)
+                    .insert(uuid, Box::new(subscriber));
+                future::ready(())
+            })
+            .await;
 
-    //         uuid
-    //     }
+        uuid
+    }
 
     //     // Remove a Subscriber for a specific Message from our subscriber list
     //     async fn unsubscribe(&self, message: Message, sub_id: Uuid) {

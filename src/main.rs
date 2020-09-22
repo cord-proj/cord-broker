@@ -8,7 +8,7 @@ use cord_message::{Codec, Message};
 use env_logger;
 use errors::*;
 use futures::{
-    future::{self, FutureExt, TryFutureExt},
+    future::{self, TryFutureExt},
     stream::{SplitSink, StreamExt, TryStreamExt},
 };
 use log::error;
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
                 // different publishers.
                 let mut futs = Vec::new();
                 for p in publishers.iter() {
-                    futs.push(p.link(publisher.clone()));
+                    futs.push(p.link(&publisher));
                 }
                 future::join_all(futs).await;
 
