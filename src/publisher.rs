@@ -65,14 +65,12 @@ impl Publisher {
     // Helper function for subscribing another publisher to our PROVIDE and REVOKE
     // messages
     async fn on_link(&self, other: &Publisher) {
-        let other1 = other.clone();
-        let other2 = other.clone();
         // Subscribe to PROVIDE messages
+        let other_c = other.clone();
+        let self_c = self.clone();
         self.subscribe(
             Message::Provide("/".into()),
-            Task(|publisher: &_, message| async {
-                other1.on_provide(message.unwrap_provide(), publisher)
-            }),
+            Task(move |message| other_c.on_provide(message.unwrap_provide(), &self_c)),
         )
         .await;
 
