@@ -5,7 +5,6 @@ mod subscriber;
 
 use clap::Parser;
 use cord_message::{Codec, Message};
-use env_logger;
 use errors::*;
 use futures::{
     future::{self, TryFutureExt},

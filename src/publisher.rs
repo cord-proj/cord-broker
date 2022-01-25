@@ -57,7 +57,7 @@ impl Publisher {
         let guard = self.inner.lock().await;
         (*guard).provides.iter().for_each(|p| {
             debug!(target: "publisher", "Replay {:?} for new joiner", p);
-            futs.push(other.on_provide(p.clone(), &self));
+            futs.push(other.on_provide(p.clone(), self));
         });
         future::join_all(futs).await;
     }
@@ -211,7 +211,7 @@ impl Publisher {
         debug!(target: "publisher", "Unsubscribe everyone from {:?} for {}", message, self);
 
         self.inner.with(move |mut guard| {
-            (*guard).subscribers.retain(|k, _| !message.contains(&k));
+            (*guard).subscribers.retain(|k, _| !message.contains(k));
             future::ready(())
         })
     }
