@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## v0.3.0
+
+- Bump Rust edition
+- Bump all dependency versions
+
 ## v0.2.0
 
 -   Bump dependencies to latest versions
