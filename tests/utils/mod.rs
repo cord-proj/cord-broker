@@ -1,3 +1,4 @@
+use futures::Future;
 use std::{
     env,
     io::Read,
@@ -7,12 +8,16 @@ use std::{
     str,
 };
 
-pub fn run_client<F: FnOnce(u16) + panic::UnwindSafe>(f: F) {
+pub async fn run_client<F, Fut>(f: F)
+where
+    F: (FnOnce(u16) -> Fut) + panic::UnwindSafe,
+    Fut: Future<Output = ()>,
+{
     // Start a new broker process
     let (mut broker, port) = start_broker();
 
     // Catch panics to ensure that we have the opportunity to terminate the broker
-    let result = panic::catch_unwind(|| f(port));
+    let result = panic::catch_unwind(|| async { f(port).await });
 
     // Terminate the broker
     broker.kill().expect("Broker was not running");
@@ -39,7 +44,8 @@ fn start_broker() -> (Child, u16) {
 
 fn command() -> Command {
     let mut c = Command::new(&bin());
-    c.args(&["-a 127.0.0.1", "-p 0"]).stdout(Stdio::piped());
+    c.args(&["-a", "127.0.0.1", "-p", "0"])
+        .stdout(Stdio::piped());
     c
 }
 

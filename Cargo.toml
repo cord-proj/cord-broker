@@ -1,7 +1,7 @@
 [package]
 name = "cord-broker"
-version = "0.2.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 authors = ["Cord Contributors"]
 license = "MPL-2.0"
 description = """
@@ -16,19 +16,19 @@ categories = ["network-programming", "data-structures"]
 include = ["src/**/*"]
 
 [dependencies]
-async-trait = "0.1"
-clap = "2.33"
-cord-message = "0.2"
-env_logger = "0.7"
+async-stream = "0.3"
+clap = { version = "3.0", features = [ "derive" ] }
+cord-message = "0.3"
+env_logger = "0.9"
 error-chain = "0.12"
 futures = "0.3"
-futures-locks = "0.6"
+futures-locks = "0.7"
 log = "0.4"
-tokio = { version = "0.2", features = [ "io-std", "io-util", "macros", "rt-threaded", "sync", "tcp" ] }
-tokio-util = { version = "0.3", features = [ "codec" ] }
+tokio = { version = "1.15", features = [ "io-std", "io-util", "macros", "net", "rt-multi-thread", "sync" ] }
+tokio-util = { version = "0.6", features = [ "codec" ] }
 uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
-#cord-client = "0.2"
-cord-message = "0.2"
+cord-client = "0.3"
+cord-message = "0.3"
 lazy_static = "1.4"

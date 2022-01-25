@@ -1,12 +1,13 @@
-use async_trait::async_trait;
 use cord_message::Message;
-use futures::Future;
+use futures::{future, Future};
 use log::debug;
+use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[async_trait]
+type SomeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 pub trait Subscriber {
-    async fn recv(&mut self, message: Message) -> bool;
+    fn recv(&mut self, message: Message) -> (bool, SomeFuture);
 }
 
 /// A Subscriber that receives a stream of messages
@@ -24,37 +25,39 @@ where
     F: Future + Send,
     T: (FnOnce(Message) -> F) + Send;
 
-#[async_trait]
 impl Subscriber for Consumer {
-    async fn recv(&mut self, message: Message) -> bool {
+    fn recv(&mut self, message: Message) -> (bool, SomeFuture) {
         debug!(target: "subscriber", "Receive message for consumer: {:?}", message);
-        self.0.send(message).is_ok()
+        (self.0.send(message).is_ok(), Box::pin(future::ready(())))
     }
 }
 
-#[async_trait]
 impl<F, T> Subscriber for Task<F, T>
 where
-    F: Future + Send,
+    F: Future<Output = ()> + Send + 'static,
     T: (FnMut(Message) -> F) + Send,
 {
-    async fn recv(&mut self, message: Message) -> bool {
+    fn recv(&mut self, message: Message) -> (bool, SomeFuture) {
         debug!(target: "subscriber", "Receive message for task: {:?}", message);
-        self.0(message).await;
-        true // Retain subscriber in map
+        // true = Retain subscriber in map
+        (true, Box::pin(self.0(message)))
     }
 }
 
-#[async_trait]
 impl<F, T> Subscriber for OnetimeTask<F, T>
 where
-    F: Future + Send,
+    F: Future<Output = ()> + Send + 'static,
     T: (FnOnce(Message) -> F) + Send,
 {
-    async fn recv(&mut self, message: Message) -> bool {
+    fn recv(&mut self, message: Message) -> (bool, SomeFuture) {
         debug!(target: "subscriber", "Receive message for one-time task: {:?}", message);
-        self.0.take().expect("OnetimeTask already executed")(message).await;
-        false // Don't retain subscriber in map
+        // false = Don't retain subscriber in map
+        (
+            false,
+            Box::pin(self.0.take().expect("OnetimeTask already executed")(
+                message,
+            )),
+        )
     }
 }
 
@@ -70,9 +73,10 @@ mod tests {
         let message_c = message.clone();
 
         let mut consumer = Consumer(tx);
-        let retain = consumer.recv(message).await;
+        let (retain, f) = consumer.recv(message);
         assert!(retain);
 
+        f.await;
         assert_eq!(rx.recv().await, Some(message_c));
     }
 
@@ -82,12 +86,14 @@ mod tests {
         let message = Message::Event("/a".into(), "abc".into());
         let message_c = message.clone();
 
-        let mut consumer = Task(|msg| async {
+        let mut consumer = Task(|msg| {
             tx.send(msg).unwrap();
+            future::ready(())
         });
-        let retain = consumer.recv(message).await;
+        let (retain, f) = consumer.recv(message);
         assert!(retain);
 
+        f.await;
         assert_eq!(rx.recv().await, Some(message_c));
     }
 
@@ -100,8 +106,9 @@ mod tests {
         let mut consumer = OnetimeTask(Some(|msg| async {
             tx.send(msg).unwrap();
         }));
-        consumer.recv(message).await;
+        let (_, f) = consumer.recv(message);
 
+        f.await;
         assert_eq!(rx.await, Ok(message_c));
     }
 }
