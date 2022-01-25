@@ -11,5 +11,7 @@ RUN apk update && \
 # Broker
 FROM alpine
 COPY --from=builder /usr/local/cargo/bin/cord-broker /usr/local/bin/cord-broker
-RUN apk update && apk upgrade
-ENTRYPOINT ["cord-broker", "--bind-address=0.0.0.0"]
+RUN apk update && \
+    apk upgrade && \
+    apk add --update libgcc
+ENTRYPOINT ["cord-broker", "--address=0.0.0.0"]

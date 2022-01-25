@@ -1,62 +1,35 @@
 mod utils;
 
-use cord_client::{Conn, Subscriber};
+use cord_client::{Client, Subscriber};
 use cord_message::Pattern;
-use futures::{Future, Stream};
-use tokio::{sync::oneshot, timer::Delay};
+use futures::stream::StreamExt;
+use tokio::sync::oneshot;
 
-use std::{
-    panic,
-    time::{Duration, Instant},
-};
-
-#[test]
-fn test_reciprocal() {
-    let f = |port| {
+#[tokio::test]
+async fn test_reciprocal() {
+    let f = |port| async move {
         let (tx, mut rx1) = oneshot::channel();
-        let client1 = Conn::new(format!("127.0.0.1:{}", port).parse().unwrap())
-            .map_err(|e| panic!("{}", e))
-            .and_then(|mut conn| {
-                conn.provide("/users".into()).unwrap();
+        let mut client1 = Client::connect(("127.0.0.1", port)).await.unwrap();
+        client1.provide("/users".into()).await.unwrap();
 
-                Delay::new(Instant::now() + Duration::from_millis(100))
-                    .map_err(|e| panic!(e))
-                    .and_then(|_| {
-                        let group_rx = conn.subscribe("/groups".into()).unwrap();
+        let group_rx = client1.subscribe("/groups".into()).await.unwrap();
 
-                        Delay::new(Instant::now() + Duration::from_millis(100))
-                            .map_err(|e| panic!(e))
-                            .and_then(move |_| {
-                                conn.event("/users/add".into(), "Mark has joined").unwrap();
-                                Ok(())
-                            })
-                            .and_then(|_| send_event(group_rx, tx))
-                    })
-            });
+        client1
+            .event("/users/add".into(), "Mark has joined")
+            .await
+            .unwrap();
+        send_event(group_rx, tx).await;
 
         let (tx, mut rx2) = oneshot::channel();
-        let client2 = Conn::new(format!("127.0.0.1:{}", port).parse().unwrap())
-            .map_err(|e| panic!("{}", e))
-            .and_then(|mut conn| {
-                conn.provide("/groups".into()).unwrap();
+        let mut client2 = Client::connect(("127.0.0.1", port)).await.unwrap();
+        client2.provide("/groups".into()).await.unwrap();
 
-                Delay::new(Instant::now() + Duration::from_millis(100))
-                    .map_err(|e| panic!(e))
-                    .and_then(|_| {
-                        let user_rx = conn.subscribe("/users".into()).unwrap();
-
-                        Delay::new(Instant::now() + Duration::from_millis(100))
-                            .map_err(|e| panic!(e))
-                            .and_then(move |_| {
-                                conn.event("/groups/add".into(), "Admin group created")
-                                    .unwrap();
-                                Ok(())
-                            })
-                            .and_then(|_| send_event(user_rx, tx))
-                    })
-            });
-
-        tokio::run(client1.join(client2).map(|_| ()));
+        let user_rx = client2.subscribe("/users".into()).await.unwrap();
+        client2
+            .event("/groups/add".into(), "Admin group created")
+            .await
+            .unwrap();
+        send_event(user_rx, tx).await;
 
         assert_eq!(
             rx1.try_recv().unwrap(),
@@ -69,17 +42,10 @@ fn test_reciprocal() {
         );
     };
 
-    utils::run_client(f);
+    utils::run_client(f).await;
 }
 
-fn send_event(
-    rx: Subscriber,
-    tx: oneshot::Sender<(Pattern, String)>,
-) -> impl Future<Item = (), Error = ()> {
-    rx.into_future()
-        .and_then(move |(opt, _)| {
-            tx.send(opt.unwrap()).unwrap();
-            Ok(())
-        })
-        .map_err(|_| ())
+async fn send_event(rx: Subscriber, tx: oneshot::Sender<(Pattern, String)>) {
+    let result = rx.into_future().await.0;
+    tx.send(result.unwrap()).unwrap();
 }

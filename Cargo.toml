@@ -1,14 +1,14 @@
 [package]
 name = "cord-broker"
-version = "0.1.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 authors = ["Cord Contributors"]
 license = "MPL-2.0"
 description = """
 The server-side routing platform for the Cord Platform that exchanges messages between
 publishers and subscribers.
 """
-homepage = "http://cord-proj.org"
+homepage = "https://cord-proj.org"
 repository = "https://github.com/cord-proj/cord-broker"
 readme = "README.md"
 keywords = ["cord", "stream"]
@@ -16,17 +16,19 @@ categories = ["network-programming", "data-structures"]
 include = ["src/**/*"]
 
 [dependencies]
-clap = "2.33"
-cord-message = "0.1"
-env_logger = "0.6"
+async-stream = "0.3"
+clap = { version = "3.0", features = [ "derive" ] }
+cord-message = "0.3"
+env_logger = "0.9"
 error-chain = "0.12"
-futures = "0.1"
-futures-locks = "0.3"
+futures = "0.3"
+futures-locks = "0.7"
 log = "0.4"
-tokio = "0.1"
-uuid = { version = "0.7", features = ["v4"] }
+tokio = { version = "1.15", features = [ "io-std", "io-util", "macros", "net", "rt-multi-thread", "sync" ] }
+tokio-util = { version = "0.6", features = [ "codec" ] }
+uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
-cord-client = "0.1"
-cord-message = "0.1"
-lazy_static = "1.3"
+cord-client = "0.3"
+cord-message = "0.3"
+lazy_static = "1.4"
