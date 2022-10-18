@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## v0.3.1
+
+- Bump all dependency versions
+
 ## v0.3.0
 
 - Bump Rust edition
